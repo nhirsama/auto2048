@@ -35,18 +35,26 @@ def train():
     # 增量训练逻辑：检查是否可以从上次结果继续
     if os.path.exists(MODEL_PATH):
         print(f">>> [断点续传] 发现已存模型 {MODEL_PATH}，正在加载训练进度...")
-        model = PPO.load(MODEL_PATH, env=env, device="cpu")
+        model = PPO.load(MODEL_PATH, env=env,
+                         verbose=1,
+                         tensorboard_log=LOG_DIR,
+                         learning_rate=1e-4,
+                         batch_size=1024,
+                         n_steps=2048,  # 每个核心单次采集的步数
+                         ent_coef=0.1,  # 从原来的 0.01 调高到 0.05，强制 AI 重新变乱，去探索
+                         )
     else:
         print(">>> [全新训练] 未发现旧模型，正在初始化神经网络...")
         model = PPO(
             "MlpPolicy",
             env,
-            device="cpu",  # 针对你的 MX250 兼容性问题强制 CPU
+            # device="cpu",  # 针对你的 MX250 兼容性问题强制 CPU
             verbose=1,
             tensorboard_log=LOG_DIR,
-            learning_rate=3e-4,
+            learning_rate=1e-4,
             batch_size=128,
-            n_steps=1024  # 每个核心单次采集的步数
+            n_steps=1024,  # 每个核心单次采集的步数
+            ent_coef=0.05,  # 从原来的 0.01 调高到 0.05，强制 AI 重新变乱，去探索
         )
 
     # 自动保存回调
@@ -60,7 +68,7 @@ def train():
     try:
         # 建议总步数：1,000,000 起步
         model.learn(
-            total_timesteps=1000000,
+            total_timesteps=10000000,
             callback=checkpoint_callback,
             reset_num_timesteps=False  # 保持 TensorBoard 曲线连续
         )

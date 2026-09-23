@@ -1,38 +1,4 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-.eggs/
-dist/
-build/
-*.egg
-
-# 虚拟环境 / uv
-.venv/
-venv/
-env/
-.python-version
-
-# Go / cgo 编译产物（由 game2048/game.go 生成）
-lib/
-*.exe
-*.test
-*.out
-
-# RL 训练产物
-checkpoints/
-logs/
-*.zip
-
-# IDE
-.idea/
-*.iml
-.vscode/
-
-# 系统
-.DS_Store
-Thumbs.db
-*~
-*.swp
+/.venv/
+/checkpoints
+/logs
+/.idea
