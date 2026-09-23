@@ -91,7 +91,7 @@ class AI2048Gui(QWidget):
         obs = self.get_ai_obs()
 
         # AI 决策
-        action, _ = self.model.predict(obs, deterministic=True)
+        action, _ = self.model.predict(obs, deterministic=False)
         print(action)
         # 执行动作
         # 注意：这里的 reward_raw 应该是你在 Go 后端定义的 mergeScore
@@ -102,13 +102,14 @@ class AI2048Gui(QWidget):
         if reward_raw > 0:
             self.total_score += reward_raw
             self.score_label.setText(f"Score: {self.total_score}")
-
+        elif reward_raw == -1:
+            print("无效操作")
         # 更新界面展示
         self.update_board()
 
         if done:
             self.timer.stop()
-            self.score_label.setText(f"GAME OVER! Final Score: {self.total_score}")
+            self.score_label.setText(f"Final Score: {self.total_score}")
             self.score_label.setStyleSheet(self.score_label.styleSheet() + "color: #f65e3b;")
 
     def update_board(self):

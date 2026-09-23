@@ -2,10 +2,14 @@
 name = "auto2048"
 version = "0.1.0"
 description = "Add your description here"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
     "gymnasium>=1.2.2",
     "pyside6>=6.10.1",
     "stable-baselines3>=2.7.1",
     "tensorboard>=2.20.0",
+    "torch>=2.6.0",
 ]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/rocm6.1"

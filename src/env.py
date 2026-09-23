@@ -7,72 +7,93 @@ from src.game import Game2048Core
 class Game2048Env(gym.Env):
     def __init__(self):
         super().__init__()
+        self.none_cnt = 0
         self.game = Game2048Core(n=4)
-        # 动作空间：0,1,2,3 (上下左右)
         self.action_space = spaces.Discrete(4)
-        # 状态空间：4x4 矩阵，值通过 log2 处理
         self.observation_space = spaces.Box(low=0, high=16, shape=(4, 4), dtype=np.float32)
+
+        # --- 优化1: 预定义 Corner Building 权重矩阵 ---
+        # 参考 qpwoeirut 的 Corner Building 策略。
+        # 这是一个"蛇形"梯度矩阵，引导大数去左上角 (0,0)，并保持通过相邻格子的连贯性。
+        # 相比你之前的路径判断，矩阵点积运算更快且梯度更平滑。
+        self.corner_weights = np.array([
+            [16, 15, 14, 13],
+            [9, 10, 11, 12],
+            [8, 7, 6, 5],
+            [1, 2, 3, 4]
+        ], dtype=np.float32)
+        # 归一化权重，避免奖励过大
+        self.corner_weights /= np.max(self.corner_weights)
 
     def _get_obs(self):
         board = np.array(self.game.get_board(), dtype=np.float32)
-        # 对非零元素取 log2
         board[board > 0] = np.log2(board[board > 0])
         return board
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.game.reset()
+        self.none_cnt = 0
         return self._get_obs(), {}
 
     def step(self, action):
-        # 保持与 game 接口一致
         board_raw, reward_raw, done = self.game.step(int(action))
+
+        # 获取 Log2 处理后的状态（用于计算 Observation 和 启发式奖励）
+        # 注意：这里我们手动处理一次用于计算，避免多次调用 _get_obs
+        board_log = np.zeros_like(board_raw, dtype=np.float32)
+        mask = board_raw > 0
+        board_log[mask] = np.log2(board_raw[mask])
+
+        if done:
+            return board_log, 0, done, False, {}
 
         reward = 0.0
 
         if reward_raw == -1:
-            # 1. 撞墙重罚：防止 AI 陷入无效循环
-            reward = -10.0
+            # 1. 撞墙/无效移动惩罚
+            self.none_cnt += 1
+            # 动态惩罚：连续无效移动惩罚加倍
+            reward = -2.0 * self.none_cnt
+            if self.none_cnt >= 10:
+                return board_log, reward, True, False, {}
         else:
-            # 2. 基础合并奖励：保持原有的得分逻辑
-            reward = float(reward_raw) * 2.0
+            self.none_cnt = 0
 
-            # 3. 空格奖励：保持棋盘开阔（权重略微调低，防止过度刷分）
+            # 2. 基础合并奖励 (Merge Score)
+            # 保持原有的逻辑，这是最基础的目标
+            reward += float(reward_raw) * 1.0
+
+            # 3. 优化后的 Corner Building 奖励
+            # 替代原有的 "蛇形路径" 循环判断。
+            # 直接计算当前盘面与权重矩阵的点积。
+            # 这鼓励大数占据高权重位置（左上角），并按权重梯度排列。
+            heuristic_score = np.sum(board_log * self.corner_weights)
+
+            # 系数 0.1 需要根据你的训练稳定性调整。
+            # 如果 Agent 过于关注摆阵而不合并，可以调低此系数。
+            reward += heuristic_score * 0.2
+
+            # 4. 单调性奖励 (Monotonicity) - 简化版
+            # qpwoeirut 强调单调性的重要性。
+            # 我们奖励每一行/列相邻元素差值较小或有序的情况。
+            # 这里简单实现：计算行和列的"逆序度"作为惩罚。
+            # (可选：为了训练速度，上面的 corner_weights 其实已经隐含了单调性引导，
+            #  如果计算资源有限，可以省略下面这一段)
+            penalty = 0
+            # 行单调性惩罚 (左边应该 >= 右边)
+            diff_row = board_log[:, :-1] - board_log[:, 1:]
+            penalty += np.sum(diff_row < 0) * 0.5  # 每一个逆序对罚 0.5
+
+            # 列单调性惩罚 (上边应该 >= 下边)
+            diff_col = board_log[:-1, :] - board_log[1:, :]
+            penalty += np.sum(diff_col < 0) * 0.5
+
+            reward -= penalty * 0.06
+
+            # 5. 空格奖励 (Empty Tile)
+            # 保持棋盘流动性的辅助奖励
             empty_count = np.sum(board_raw == 0)
-            reward += empty_count * 0.8
+            reward += empty_count * 0.6
 
-            # --- 4. 蛇形布局与单调性奖励 ---
-            # 我们定义一条从左上到右下的蛇形路径，目标是让数字沿路径递增
-            # 路径索引: (0,0) -> (0,1) -> (0,2) -> (0,3) -> (1,3) -> (1,2) ...
-            snake_path = [
-                (0, 0), (0, 1), (0, 2), (0, 3),
-                (1, 3), (1, 2), (1, 1), (1, 0),
-                (2, 0), (2, 1), (2, 2), (2, 3),
-                (3, 3), (3, 2), (3, 1), (3, 0)
-            ]
-
-            # 获取当前棋盘的数值（用于计算单调性）
-            # 注意：这里直接用原始值或 log2 值均可，log2 值更平滑
-            log_board = self._get_obs()
-
-            mono_reward = 0
-            for i in range(len(snake_path) - 1):
-                prev_val = log_board[snake_path[i]]
-                next_val = log_board[snake_path[i + 1]]
-
-                # 如果后一个格子比前一个大（符合向末端递增的蛇形趋势）
-                if next_val >= prev_val and next_val > 0:
-                    # 奖励与数值大小成正比
-                    mono_reward += next_val * 0.5
-                elif next_val < prev_val:
-                    # 违背蛇形排列则给予小惩罚
-                    mono_reward -= prev_val * 0.2
-
-            reward += mono_reward
-
-            # 5. 角落大数奖励：如果最大值在蛇形路径的终点 (3,0) 或起点 (0,0)
-            max_tile_log = np.max(log_board)
-            if log_board[3, 0] == max_tile_log or log_board[0, 0] == max_tile_log:
-                reward += max_tile_log * 2.0
-
-        return self._get_obs(), reward, done, False, {}
+        return board_log, reward, done, False, {}

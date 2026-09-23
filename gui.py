@@ -28,7 +28,7 @@ class App(QWidget):
     def keyPressEvent(self, event):
         mapping = {Qt.Key_Up: 0, Qt.Key_Down: 1, Qt.Key_Left: 2, Qt.Key_Right: 3}
         if event.key() in mapping:
-            board,  done = self.game.step(mapping[event.key()])
+            board,ok,  done = self.game.step(mapping[event.key()])
             self.update_ui()
 
     def update_ui(self):

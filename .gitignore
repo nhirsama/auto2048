@@ -2,3 +2,5 @@
 /checkpoints
 /logs
 /.idea
+__pycache__/
+*.py[cod]

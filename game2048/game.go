@@ -2,15 +2,76 @@ package main
 
 import "C"
 import (
-	"fmt"
+	"sync"
 	"unsafe"
 )
 
+var (
+	rowMoveTable  [65536]uint16
+	rowScoreTable [65536]uint32
+	initOnce      sync.Once
+)
+
+type Game struct {
+	Board uint64 // 4x4 棋盘，每个格子 4-bit (存储 log2 值)
+}
+
 var globalGame *Game
+
+// ==========================================
+// 1. 查找表初始化 (修复了合并时的分数计算逻辑)
+// ==========================================
+func initLUT() {
+	for row := 0; row < 65536; row++ {
+		// 解析行：row 的位布局为 [T3][T2][T1][T0] (从低位到高位)
+		line := [4]int{
+			(row >> 0) & 0xF,
+			(row >> 4) & 0xF,
+			(row >> 8) & 0xF,
+			(row >> 12) & 0xF,
+		}
+
+		score := 0
+		next := [4]int{0, 0, 0, 0}
+		p := 0
+		// 压缩空格
+		for _, v := range line {
+			if v != 0 {
+				next[p] = v
+				p++
+			}
+		}
+
+		// 合并
+		for i := 0; i < 3; i++ {
+			if next[i] != 0 && next[i] == next[i+1] {
+				next[i]++             // 数值翻倍 (log2+1)
+				score += 1 << next[i] // 增加合并后的真实分数
+				for j := i + 1; j < 3; j++ {
+					next[j] = next[j+1]
+				}
+				next[3] = 0
+			}
+		}
+
+		var resRow uint16
+		for i := 0; i < 4; i++ {
+			resRow |= uint16(next[i]) << (i * 4)
+		}
+		rowMoveTable[row] = resRow
+		rowScoreTable[row] = uint32(score)
+	}
+}
+
+// ==========================================
+// 2. 导出 API (保持接口不变)
+// ==========================================
 
 //export InitGame
 func InitGame(n C.int) {
-	globalGame = NewGame(int(n))
+	initOnce.Do(initLUT)
+	globalGame = &Game{}
+	globalGame.Reset()
 }
 
 //export ResetGame
@@ -30,187 +91,124 @@ func StepGame(action C.int) (C.int, C.int) {
 
 //export GetBoard
 func GetBoard(ptr *C.int) {
-	// 将 Go 的棋盘数据拷贝到 C 传过来的指针内存中
-	board := globalGame.Board
-	for i, v := range board {
-		// 使用 unsafe 指针操作
-		*(*C.int)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + uintptr(i)*4)) = C.int(v)
-	}
-}
-
-func main() {
-	game := NewGame(4)
-	for {
-		var mv int
-		fmt.Scanf("%d", &mv)
-		reward, done := game.Step(mv) // 尝试向左滑
-		if done {
-			fmt.Println("done")
-			break
-		} else {
-			fmt.Println("reward", reward)
-			for i := 0; i < 4; i++ {
-				for j := 0; j < 4; j++ {
-					fmt.Printf("%d", game.Board[i*4+j])
-				}
-				fmt.Println()
-			}
+	b := globalGame.Board
+	// 解压逻辑：确保 4-bit 块正确映射到 4x4 数组
+	for i := 0; i < 16; i++ {
+		val := (b >> (i * 4)) & 0xF
+		realVal := 0
+		if val > 0 {
+			realVal = 1 << val
 		}
+		// 安全地写入 C 数组
+		target := (*C.int)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + uintptr(i)*unsafe.Sizeof(C.int(0))))
+		*target = C.int(realVal)
 	}
 }
 
-type Game struct {
-	N          int   // 棋盘边长
-	Board      []int // 一维数组表示的棋盘，大小为 N*N
-	TotalScore int   // 累计总分
+// ==========================================
+// 3. 高性能位运算逻辑 (核心 Bug 修复)
+// ==========================================
+
+// 修复后的转置函数：针对 4x4 的 4-bit 块矩阵
+func transpose(x uint64) uint64 {
+	a1 := x & 0xF0F00F0FF0F00F0F
+	a2 := x & 0x0000F0F00000F0F0
+	a3 := x & 0x0F0F00000F0F0000
+	x = a1 | (a2 << 12) | (a3 >> 12)
+	a1 = x & 0xFF00FF0000FF00FF
+	a2 = x & 0x00000000FF00FF00
+	a3 = x & 0x00FF00FF00000000
+	x = a1 | (a2 << 24) | (a3 >> 24)
+	return x
 }
 
-// NewGame 创建并初始化一个 N*N 的游戏
-func NewGame(n int) *Game {
-	g := &Game{
-		N:     n,
-		Board: make([]int, n*n),
-	}
-	g.Reset()
-	return g
+// 快速水平翻转：将 [T3][T2][T1][T0] 变为 [T0][T1][T2][T3]
+func reverseRow(row uint16) uint16 {
+	return (row >> 12) | ((row >> 4) & 0x00F0) | ((row << 4) & 0x0F00) | (row << 12)
 }
 
-// Reset 重置游戏状态并生成第一个方块
-func (g *Game) Reset() {
-	for i := range g.Board {
-		g.Board[i] = 0
-	}
-	g.TotalScore = 0
-	g.SpawnFixed()
-}
+func (g *Game) Step(action int) (int, bool) {
+	oldBoard := g.Board
+	var totalScore uint32
+	tmpBoard := g.Board
 
-// SpawnFixed 核心逻辑：按固定顺序（从左到右，从上到下）在第一个空格生成 2
-func (g *Game) SpawnFixed() bool {
-	for i := 0; i < len(g.Board); i++ {
-		if g.Board[i] == 0 {
-			g.Board[i] = 2
-			return true
-		}
-	}
-	return false
-}
-
-// getTile 坐标转换：根据动作方向，将 (i, j) 映射到一维 Board 的索引
-// i 是行索引，j 是列内部偏移（0到N-1）
-func (g *Game) getTile(action, i, j int) int {
-	switch action {
-	case 0:
-		return g.Board[j*g.N+i] // Up: i为列，j为行
-	case 1:
-		return g.Board[(g.N-1-j)*g.N+i] // Down
-	case 2:
-		return g.Board[i*g.N+j] // Left: i为行，j为列
-	case 3:
-		return g.Board[i*g.N+(g.N-1-j)] // Right
-	default:
-		return 0
-	}
-}
-
-// setTile 坐标转换：将合并后的值写回一维数组
-func (g *Game) setTile(action, i, j, val int) {
-	switch action {
-	case 0:
-		g.Board[j*g.N+i] = val
-	case 1:
-		g.Board[(g.N-1-j)*g.N+i] = val
-	case 2:
-		g.Board[i*g.N+j] = val
-	case 3:
-		g.Board[i*g.N+(g.N-1-j)] = val
-	}
-}
-
-// mergeLine 核心合并算法：处理一行/一列的压缩与合并
-func (g *Game) mergeLine(line []int) ([]int, int) {
-	n := len(line)
-	next := make([]int, n)
-	score := 0
-
-	// 1. 挤压：去掉所有 0
-	p := 0
-	for _, v := range line {
-		if v != 0 {
-			next[p] = v
-			p++
-		}
+	// 统一转换逻辑
+	if action == 0 || action == 1 { // Up, Down
+		tmpBoard = transpose(tmpBoard)
 	}
 
-	// 2. 合并：相邻相等则翻倍
-	for i := 0; i < n-1; i++ {
-		if next[i] != 0 && next[i] == next[i+1] {
-			next[i] *= 2
-			score += next[i]
-			// 后面元素前移
-			for j := i + 1; j < n-1; j++ {
-				next[j] = next[j+1]
-			}
-			next[n-1] = 0
-		}
-	}
-	return next, score
-}
-
-// Step 执行一步动作 (0:Up, 1:Down, 2:Left, 3:Right)
-func (g *Game) Step(action int) (reward int, done bool) {
-	changed := false
-	moveScore := 0
-
-	for i := 0; i < g.N; i++ {
-		// 提取当前方向的“线”
-		line := make([]int, g.N)
-		for j := 0; j < g.N; j++ {
-			line[j] = g.getTile(action, i, j)
+	var resBoard uint64
+	for i := 0; i < 4; i++ {
+		row := uint16(tmpBoard >> (i * 16))
+		// Down (1) 和 Right (3) 需要水平翻转后再查表
+		if action == 1 || action == 3 {
+			row = reverseRow(row)
 		}
 
-		// 合并
-		merged, score := g.mergeLine(line)
-		moveScore += score
+		resRow := rowMoveTable[row]
+		totalScore += rowScoreTable[row]
 
-		// 写回并检查是否有变化
-		for j := 0; j < g.N; j++ {
-			if g.getTile(action, i, j) != merged[j] {
-				g.setTile(action, i, j, merged[j])
-				changed = true
-			}
+		if action == 1 || action == 3 {
+			resRow = reverseRow(resRow)
 		}
+		resBoard |= uint64(resRow) << (i * 16)
 	}
 
-	// 如果没有方块移动或合并，判定为无效动作
-	if !changed {
+	if action == 0 || action == 1 {
+		resBoard = transpose(resBoard)
+	}
+
+	if resBoard == oldBoard {
 		return -1, g.IsGameOver()
 	}
 
-	g.TotalScore += moveScore
-	g.SpawnFixed() // 动作有效才生成新方块
-	return moveScore, g.IsGameOver()
+	g.Board = resBoard
+	g.SpawnFixed()
+	return int(totalScore), g.IsGameOver()
 }
 
-// IsGameOver 检查是否无法再移动
+func (g *Game) SpawnFixed() {
+	// 找到第一个空位生成一个 2 (log2 值为 1)
+	for i := 0; i < 16; i++ {
+		if (g.Board >> (i * 4) & 0xF) == 0 {
+			g.Board |= uint64(1) << (i * 4)
+			break
+		}
+	}
+}
+
 func (g *Game) IsGameOver() bool {
-	// 检查是否有空位
-	for _, v := range g.Board {
-		if v == 0 {
+	// 1. 检查是否有空格
+	for i := 0; i < 16; i++ {
+		if (g.Board >> (i * 4) & 0xF) == 0 {
 			return false
 		}
 	}
-	// 检查相邻是否可合并
-	for i := 0; i < g.N; i++ {
-		for j := 0; j < g.N-1; j++ {
-			// 水平相邻
-			if g.Board[i*g.N+j] == g.Board[i*g.N+j+1] {
+	// 2. 检查水平和垂直方向是否还能合并
+	for i := 0; i < 4; i++ {
+		row := (g.Board >> (i * 16)) & 0xFFFF
+		for j := 0; j < 3; j++ {
+			if (row>>(j*4))&0xF == (row>>((j+1)*4))&0xF {
 				return false
 			}
-			// 垂直相邻
-			if g.Board[j*g.N+i] == g.Board[(j+1)*g.N+i] {
+		}
+	}
+	// 利用转置检查垂直方向
+	tBoard := transpose(g.Board)
+	for i := 0; i < 4; i++ {
+		row := (tBoard >> (i * 16)) & 0xFFFF
+		for j := 0; j < 3; j++ {
+			if (row>>(j*4))&0xF == (row>>((j+1)*4))&0xF {
 				return false
 			}
 		}
 	}
 	return true
 }
+
+func (g *Game) Reset() {
+	g.Board = 0
+	g.SpawnFixed()
+}
+
+func main() {}
